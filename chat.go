@@ -7,10 +7,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"strings"
 	"log"
 	"net/http"
 	"os"
-	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -18,8 +18,9 @@ import (
 )
 
 type CreateChatRequest struct {
-	Name      string `json:"name" binding:"required"`
-	IsPrivate bool   `json:"isPrivate"`
+	ID		  uuid.UUID	`json:"id"`
+	Name      string 	`json:"name" binding:"required"`
+	IsPrivate bool   	`json:"isPrivate"`
 }
 
 type ChatResponse struct {
@@ -110,6 +111,7 @@ func createChatHandler(c *gin.Context) {
 
 	userID := c.MustGet("userID").(uuid.UUID)
 	chat := Chat{
+		ID:		   req.ID,
 		Name:      req.Name,
 		IsPrivate: req.IsPrivate,
 		UserID:    userID,
@@ -318,8 +320,8 @@ func prepareOllamaRequest(messages []OllamaMessage, model string) OllamaChatRequ
 	}
 }
 
-func setupSSEHeaders(c *gin.Context) {
-	c.Header("Content-Type", "text/event-stream")
+func setupStreamHeaders(c *gin.Context) {
+	c.Header("Content-Type", "text/plain")
 	c.Header("Cache-Control", "no-cache")
 	c.Header("Connection", "keep-alive")
 	c.Header("Transfer-Encoding", "chunked")
@@ -413,7 +415,7 @@ func streamAIResponseHandler(c *gin.Context) {
 
 	// Prepare and send Ollama request
 	ollamaReq := prepareOllamaRequest(ollamaMessages, req.Model)
-	setupSSEHeaders(c)
+	setupStreamHeaders(c)
 
 	// Create channels for response handling
 	responseChan := make(chan string)
@@ -466,7 +468,6 @@ func streamAIResponseHandler(c *gin.Context) {
 			// Skip [DONE] message
 			if jsonData == "[DONE]" {
 				log.Println("✅ Received [DONE] message")
-				close(responseChan)
 				return
 			}
 
@@ -485,6 +486,9 @@ func streamAIResponseHandler(c *gin.Context) {
 
 			// Process each choice in the response
 			for _, choice := range ollamaResp.Choices {
+				if choice.Delta.Content != "" {
+					responseChan <- choice.Delta.Content
+				}
 				if choice.FinishReason == "stop" {
 					log.Println("✅ Response completed")
 					close(responseChan)
@@ -522,11 +526,11 @@ func streamAIResponseHandler(c *gin.Context) {
 			}
 			
 			fullResponse += token
-			c.SSEvent("message", token)
+			fmt.Fprint(w, token)
 			return true
 			
 		case err := <-errorChan:
-			c.SSEvent("error", err.Error())
+			fmt.Fprint(w, "Error: "+err.Error())
 			return false
 			
 		case <-c.Request.Context().Done():
