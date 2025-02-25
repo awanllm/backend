@@ -88,7 +88,7 @@ func listChatsHandler(c *gin.Context) {
 		return
 	}
 
-	var response []ChatResponse
+	var response = make([]ChatResponse, 0)
 	for _, chat := range chats {
 		response = append(response, ChatResponse{
 			ID:        chat.ID,
