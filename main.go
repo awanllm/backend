@@ -10,6 +10,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/go-redis/redis/v8"
+	"github.com/google/uuid"
 	"github.com/joho/godotenv"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
@@ -22,25 +23,32 @@ var (
 
 // User represents the user model
 type User struct {
-	gorm.Model
-	Username     string `gorm:"uniqueIndex"`
-	Email        string `gorm:"uniqueIndex"`
+	ID           uuid.UUID `gorm:"type:uuid;primary_key;default:gen_random_uuid()"`
+	CreatedAt    time.Time
+	UpdatedAt    time.Time
+	DeletedAt    gorm.DeletedAt `gorm:"index"`
+	Username     string         `gorm:"uniqueIndex"`
+	Email        string         `gorm:"uniqueIndex"`
 	PasswordHash string
 }
 
 // Chat represents a chat room
 type Chat struct {
-	gorm.Model
+	ID        uuid.UUID `gorm:"type:uuid;primary_key;default:gen_random_uuid()"`
+	CreatedAt time.Time
+	UpdatedAt time.Time
 	Name      string
 	IsPrivate bool
-	UserID    uint // Creator of the chat
+	UserID    uuid.UUID `gorm:"type:uuid"` // Creator of the chat
 }
 
 // Message represents a chat message
 type Message struct {
-	gorm.Model
-	ChatID    uint
-	UserID    uint
+	ID        uuid.UUID `gorm:"type:uuid;primary_key;default:gen_random_uuid()"`
+	CreatedAt time.Time
+	UpdatedAt time.Time
+	ChatID    uuid.UUID `gorm:"type:uuid"`
+	Role      string    `gorm:"type:varchar(10);check:role IN ('user', 'assistant')"` // Role can be 'user' or 'assistant'
 	Content   string
 	Timestamp time.Time
 }
@@ -118,8 +126,8 @@ func setupRouter() *gin.Engine {
 			auth.POST("/login", loginHandler)
 		}
 
-		// Chat routes
-		chats := api.Group("/chats")
+		// Chat routes - protected by authentication
+		chats := api.Group("/chats", authMiddleware())
 		{
 			chats.GET("", listChatsHandler)
 			chats.POST("", createChatHandler)

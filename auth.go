@@ -7,6 +7,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt/v5"
+	"github.com/google/uuid"
 	"golang.org/x/crypto/bcrypt"
 )
 
@@ -109,7 +110,7 @@ func loginHandler(c *gin.Context) {
 
 func generateJWT(user User) (string, error) {
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
-		"sub": user.ID,
+		"sub": user.ID.String(),
 		"exp": time.Now().Add(time.Hour * 24).Unix(),
 	})
 
@@ -148,7 +149,20 @@ func authMiddleware() gin.HandlerFunc {
 			return
 		}
 
-		userID := uint(claims["sub"].(float64))
+		userIDStr, ok := claims["sub"].(string)
+		if !ok {
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid user ID in token"})
+			c.Abort()
+			return
+		}
+
+		userID, err := uuid.Parse(userIDStr)
+		if err != nil {
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid user ID format"})
+			c.Abort()
+			return
+		}
+
 		c.Set("userID", userID)
 		c.Next()
 	}
