@@ -7,20 +7,28 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"strings"
 	"log"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 )
 
+// Constants for Redis
+const (
+	RedisCacheTTL      = time.Hour * 24
+	ChatCacheKeyFormat = "chat:%s"
+	MsgCacheKeyFormat  = "chat:%s:messages"
+)
+
+// Request and response types
 type CreateChatRequest struct {
-	ID		  uuid.UUID	`json:"id"`
-	Name      string 	`json:"name" binding:"required"`
-	IsPrivate bool   	`json:"isPrivate"`
+	ID        uuid.UUID `json:"id"`
+	Name      string    `json:"name" binding:"required"`
+	IsPrivate bool      `json:"isPrivate"`
 }
 
 type ChatResponse struct {
@@ -35,6 +43,15 @@ type MessageRequest struct {
 	Model   string `json:"model" binding:"omitempty"` // Optional, will use OLLAMA_DEFAULT_MODEL if not provided
 }
 
+type MessageResponse struct {
+	ID        uuid.UUID `json:"id"`
+	ChatID    uuid.UUID `json:"chatId"`
+	Role      string    `json:"role"`
+	Content   string    `json:"content"`
+	Timestamp time.Time `json:"timestamp"`
+}
+
+// Ollama API types
 type OllamaMessage struct {
 	Role    string `json:"role"`
 	Content string `json:"content"`
@@ -72,18 +89,215 @@ type APIError struct {
 	Type    string `json:"type"`
 }
 
-type MessageResponse struct {
-	ID        uuid.UUID `json:"id"`
-	ChatID    uuid.UUID `json:"chatId"`
-	Role      string    `json:"role"`
-	Content   string    `json:"content"`
-	Timestamp time.Time `json:"timestamp"`
+// Redis cache helper functions
+func getChatCacheKey(chatID uuid.UUID) string {
+	return fmt.Sprintf(ChatCacheKeyFormat, chatID)
 }
 
+func getMessagesCacheKey(chatID uuid.UUID) string {
+	return fmt.Sprintf(MsgCacheKeyFormat, chatID.String())
+}
+
+func cacheObject(ctx context.Context, key string, obj interface{}) error {
+	data, err := json.Marshal(obj)
+	if err != nil {
+		return fmt.Errorf("failed to marshal object: %v", err)
+	}
+
+	return rdb.Set(ctx, key, data, RedisCacheTTL).Err()
+}
+
+func getCachedObject(ctx context.Context, key string, obj interface{}) error {
+	data, err := rdb.Get(ctx, key).Bytes()
+	if err != nil {
+		return err
+	}
+
+	return json.Unmarshal(data, obj)
+}
+
+// Message handling functions
+func cacheMessage(ctx context.Context, chatID uuid.UUID, msg MessageResponse) error {
+	msgJSON, err := json.Marshal(msg)
+	if err != nil {
+		return fmt.Errorf("failed to marshal message: %v", err)
+	}
+
+	cacheKey := getMessagesCacheKey(chatID)
+	pipe := rdb.Pipeline()
+	pipe.RPush(ctx, cacheKey, msgJSON)
+	pipe.Expire(ctx, cacheKey, RedisCacheTTL)
+
+	_, err = pipe.Exec(ctx)
+	return err
+}
+
+func createAndSaveMessage(ctx context.Context, chatID uuid.UUID, role, content string) (*Message, error) {
+	message := Message{
+		ChatID:    chatID,
+		Role:      role,
+		Content:   content,
+		Timestamp: time.Now(),
+	}
+
+	// Save to database
+	if err := db.Create(&message).Error; err != nil {
+		return nil, fmt.Errorf("failed to save message: %v", err)
+	}
+
+	// Cache the message
+	msgResponse := messageToResponse(message)
+	if err := cacheMessage(ctx, chatID, msgResponse); err != nil {
+		log.Printf("Failed to cache message: %v", err)
+	}
+
+	return &message, nil
+}
+
+func getChatMessages(ctx context.Context, chatID uuid.UUID) ([]Message, error) {
+	cacheKey := getMessagesCacheKey(chatID)
+
+	// Try cache first
+	messages, err := getCachedMessages(ctx, cacheKey)
+	if err == nil && len(messages) > 0 {
+		return messages, nil
+	}
+
+	// Fallback to database
+	var dbMessages []Message
+	if err := db.Where("chat_id = ?", chatID).Order("created_at ASC").Find(&dbMessages).Error; err != nil {
+		return nil, err
+	}
+
+	// Cache results for next time
+	if err := cacheMessagesFromDB(ctx, cacheKey, dbMessages); err != nil {
+		log.Printf("Failed to cache messages: %v", err)
+	}
+
+	return dbMessages, nil
+}
+
+func getCachedMessages(ctx context.Context, cacheKey string) ([]Message, error) {
+	var messages []Message
+
+	cachedMsgs, err := rdb.LRange(ctx, cacheKey, 0, -1).Result()
+	if err != nil {
+		return nil, err
+	}
+
+	for _, msgStr := range cachedMsgs {
+		var msgResponse MessageResponse
+		if err := json.Unmarshal([]byte(msgStr), &msgResponse); err != nil {
+			return nil, err
+		}
+		messages = append(messages, responseToMessage(msgResponse))
+	}
+
+	return messages, nil
+}
+
+func cacheMessagesFromDB(ctx context.Context, cacheKey string, messages []Message) error {
+	pipe := rdb.Pipeline()
+	pipe.Del(ctx, cacheKey)
+
+	for _, msg := range messages {
+		msgJSON, err := json.Marshal(messageToResponse(msg))
+		if err != nil {
+			continue
+		}
+		pipe.RPush(ctx, cacheKey, msgJSON)
+	}
+
+	pipe.Expire(ctx, cacheKey, RedisCacheTTL)
+	_, err := pipe.Exec(ctx)
+	return err
+}
+
+// Conversion helpers
+func messageToResponse(msg Message) MessageResponse {
+	return MessageResponse{
+		ID:        msg.ID,
+		ChatID:    msg.ChatID,
+		Role:      msg.Role,
+		Content:   msg.Content,
+		Timestamp: msg.Timestamp,
+	}
+}
+
+func responseToMessage(resp MessageResponse) Message {
+	return Message{
+		ID:        resp.ID,
+		ChatID:    resp.ChatID,
+		Role:      resp.Role,
+		Content:   resp.Content,
+		Timestamp: resp.Timestamp,
+	}
+}
+
+func messagesToResponses(messages []Message) []MessageResponse {
+	responses := make([]MessageResponse, len(messages))
+	for i, msg := range messages {
+		responses[i] = messageToResponse(msg)
+	}
+	return responses
+}
+
+func convertToOllamaMessages(messages []Message) []OllamaMessage {
+	ollamaMessages := make([]OllamaMessage, 0, len(messages))
+	for _, msg := range messages {
+		ollamaMessages = append(ollamaMessages, OllamaMessage{
+			Role:    msg.Role,
+			Content: msg.Content,
+		})
+	}
+	return ollamaMessages
+}
+
+// Ollama API helpers
+func prepareOllamaRequest(messages []OllamaMessage, model string) OllamaChatRequest {
+	if model == "" {
+		model = os.Getenv("OLLAMA_DEFAULT_MODEL")
+	}
+
+	return OllamaChatRequest{
+		Model:       model,
+		Messages:    messages,
+		Stream:      true,
+		Temperature: 0.7,
+	}
+}
+
+func getOllamaURL() string {
+	ollamaHost := os.Getenv("OLLAMA_HOST")
+	return fmt.Sprintf("https://%s/chat/completions", ollamaHost)
+}
+
+func setupOllamaRequest(messages []OllamaMessage, model string) (*http.Request, error) {
+	ollamaReq := prepareOllamaRequest(messages, model)
+
+	reqBody, err := json.Marshal(ollamaReq)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal request: %v", err)
+	}
+
+	// Log the request for debugging
+	log.Printf("🌐 Sending request to Ollama: %s", string(reqBody))
+
+	// Create HTTP request
+	req, err := http.NewRequest("POST", getOllamaURL(), bytes.NewBuffer(reqBody))
+	if err != nil {
+		return nil, err
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	return req, nil
+}
+
+// Chat handlers
 func listChatsHandler(c *gin.Context) {
 	userID := c.MustGet("userID").(uuid.UUID)
 	var chats []Chat
-	
+
 	if err := db.Where("user_id = ?", userID).Find(&chats).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch chats"})
 		return
@@ -111,7 +325,7 @@ func createChatHandler(c *gin.Context) {
 
 	userID := c.MustGet("userID").(uuid.UUID)
 	chat := Chat{
-		ID:		   req.ID,
+		ID:        req.ID,
 		Name:      req.Name,
 		IsPrivate: req.IsPrivate,
 		UserID:    userID,
@@ -122,17 +336,15 @@ func createChatHandler(c *gin.Context) {
 		return
 	}
 
-	// Cache the chat data in Redis
-	ctx := context.Background()
+	// Cache the chat data
 	chatResponse := ChatResponse{
 		ID:        chat.ID,
 		Name:      chat.Name,
 		IsPrivate: chat.IsPrivate,
 		CreatedAt: chat.CreatedAt,
 	}
-	chatJSON, _ := json.Marshal(chatResponse)
-	chatKey := fmt.Sprintf("chat:%s", chat.ID)
-	if err := rdb.Set(ctx, chatKey, chatJSON, time.Hour*24).Err(); err != nil {
+
+	if err := cacheObject(context.Background(), getChatCacheKey(chat.ID), chatResponse); err != nil {
 		log.Printf("Failed to cache chat data: %v", err)
 	}
 
@@ -147,16 +359,13 @@ func getChatHandler(c *gin.Context) {
 	}
 
 	ctx := context.Background()
-	chatKey := fmt.Sprintf("chat:%s", chatID)
+	cacheKey := getChatCacheKey(chatID)
 
 	// Try to get chat from Redis first
-	chatData, err := rdb.Get(ctx, chatKey).Bytes()
-	if err == nil {
-		var chatResponse ChatResponse
-		if err := json.Unmarshal(chatData, &chatResponse); err == nil {
-			c.JSON(http.StatusOK, chatResponse)
-			return
-		}
+	var chatResponse ChatResponse
+	if err := getCachedObject(ctx, cacheKey, &chatResponse); err == nil {
+		c.JSON(http.StatusOK, chatResponse)
+		return
 	}
 
 	// If not in cache, get from database
@@ -167,112 +376,18 @@ func getChatHandler(c *gin.Context) {
 	}
 
 	// Cache the chat data
-	chatResponse := ChatResponse{
+	chatResponse = ChatResponse{
 		ID:        chat.ID,
 		Name:      chat.Name,
 		IsPrivate: chat.IsPrivate,
 		CreatedAt: chat.CreatedAt,
 	}
-	chatJSON, _ := json.Marshal(chatResponse)
-	if err := rdb.Set(ctx, chatKey, chatJSON, time.Hour*24).Err(); err != nil {
+
+	if err := cacheObject(ctx, cacheKey, chatResponse); err != nil {
 		log.Printf("Failed to cache chat data: %v", err)
 	}
 
 	c.JSON(http.StatusOK, chatResponse)
-}
-
-func cacheMessage(ctx context.Context, cacheKey string, msg MessageResponse) error {
-	msgJSON, err := json.Marshal(msg)
-	if err != nil {
-		return fmt.Errorf("failed to marshal message: %v", err)
-	}
-
-	msgPipe := rdb.Pipeline()
-	msgPipe.RPush(ctx, cacheKey, msgJSON)
-	msgPipe.Expire(ctx, cacheKey, time.Hour*24)
-
-	if _, err := msgPipe.Exec(ctx); err != nil {
-		return fmt.Errorf("failed to cache message: %v", err)
-	}
-	return nil
-}
-
-func getCachedMessages(ctx context.Context, cacheKey string) ([]Message, error) {
-	var messages []Message
-
-	// Try to get messages from Redis
-	cachedMsgs, err := rdb.LRange(ctx, cacheKey, 0, -1).Result()
-	if err != nil {
-		return nil, fmt.Errorf("failed to get messages from cache: %v", err)
-	}
-
-	for _, msgStr := range cachedMsgs {
-		var msgResponse MessageResponse
-		if err := json.Unmarshal([]byte(msgStr), &msgResponse); err != nil {
-			return nil, fmt.Errorf("failed to unmarshal message: %v", err)
-		}
-		messages = append(messages, Message{
-			ID:        msgResponse.ID,
-			ChatID:    msgResponse.ChatID,
-			Role:      msgResponse.Role,
-			Content:   msgResponse.Content,
-			Timestamp: msgResponse.Timestamp,
-		})
-	}
-
-	return messages, nil
-}
-
-func cacheMessagesFromDB(ctx context.Context, cacheKey string, messages []Message) error {
-	msgPipe := rdb.Pipeline()
-	msgPipe.Del(ctx, cacheKey)
-
-	for _, msg := range messages {
-		msgResponse := MessageResponse{
-			ID:        msg.ID,
-			ChatID:    msg.ChatID,
-			Role:      msg.Role,
-			Content:   msg.Content,
-			Timestamp: msg.Timestamp,
-		}
-		msgJSON, err := json.Marshal(msgResponse)
-		if err != nil {
-			log.Printf("Failed to marshal message: %v", err)
-			continue
-		}
-		msgPipe.RPush(ctx, cacheKey, msgJSON)
-	}
-
-	msgPipe.Expire(ctx, cacheKey, time.Hour*24)
-	if _, err := msgPipe.Exec(ctx); err != nil {
-		return fmt.Errorf("failed to cache messages: %v", err)
-	}
-	return nil
-}
-
-func convertToOllamaMessages(messages []Message) []OllamaMessage {
-	ollamaMessages := make([]OllamaMessage, 0, len(messages))
-	for _, msg := range messages {
-		ollamaMessages = append(ollamaMessages, OllamaMessage{
-			Role:    msg.Role,
-			Content: msg.Content,
-		})
-	}
-	return ollamaMessages
-}
-
-func convertMessagesToResponse(messages []Message) []MessageResponse {
-	response := make([]MessageResponse, len(messages))
-	for i, msg := range messages {
-		response[i] = MessageResponse{
-			ID:        msg.ID,
-			ChatID:    msg.ChatID,
-			Role:      msg.Role,
-			Content:   msg.Content,
-			Timestamp: msg.Timestamp,
-		}
-	}
-	return response
 }
 
 func getChatMessagesHandler(c *gin.Context) {
@@ -282,95 +397,13 @@ func getChatMessagesHandler(c *gin.Context) {
 		return
 	}
 
-	ctx := context.Background()
-	cacheKey := fmt.Sprintf("chat:%s:messages", chatID.String())
-
-	// Try to get messages from cache
-	messages, err := getCachedMessages(ctx, cacheKey)
-	if err == nil && len(messages) > 0 {
-		c.JSON(http.StatusOK, convertMessagesToResponse(messages))
-		return
-	}
-
-	// If not in cache, get from database
-	var dbMessages []Message
-	if err := db.Where("chat_id = ?", chatID).Order("created_at DESC").Find(&dbMessages).Error; err != nil {
+	messages, err := getChatMessages(context.Background(), chatID)
+	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch messages"})
 		return
 	}
 
-	// Cache the messages from database
-	if err := cacheMessagesFromDB(ctx, cacheKey, dbMessages); err != nil {
-		log.Printf("Failed to cache messages: %v", err)
-	}
-
-	c.JSON(http.StatusOK, convertMessagesToResponse(dbMessages))
-}
-
-func prepareOllamaRequest(messages []OllamaMessage, model string) OllamaChatRequest {
-	if model == "" {
-		model = os.Getenv("OLLAMA_DEFAULT_MODEL")
-	}
-
-	return OllamaChatRequest{
-		Model:       model,
-		Messages:    messages,
-		Stream:      true,
-		Temperature: 0.7,
-	}
-}
-
-func setupStreamHeaders(c *gin.Context) {
-	c.Header("Content-Type", "text/plain")
-	c.Header("Cache-Control", "no-cache")
-	c.Header("Connection", "keep-alive")
-	c.Header("Transfer-Encoding", "chunked")
-}
-
-func logOllamaRequest(ollamaReq OllamaChatRequest) error {
-	reqBody, err := json.Marshal(ollamaReq)
-	if err != nil {
-		return fmt.Errorf("failed to marshal request: %v", err)
-	}
-	log.Printf("🌐 Sending request to Ollama: %s", string(reqBody))
-	return nil
-}
-
-func getOllamaURL() string {
-	ollamaHost := os.Getenv("OLLAMA_HOST")
-	ollamaURL := fmt.Sprintf("https://%s/chat/completions", ollamaHost)
-	log.Printf("🔗 Connecting to Ollama at: %s", ollamaURL)
-	return ollamaURL
-}
-
-func createAndCacheMessage(ctx context.Context, chatID uuid.UUID, role, content string) (*Message, error) {
-	message := Message{
-		ChatID:    chatID,
-		Role:      role,
-		Content:   content,
-		Timestamp: time.Now(),
-	}
-
-	// Save to database
-	if err := db.Create(&message).Error; err != nil {
-		return nil, fmt.Errorf("failed to save message: %v", err)
-	}
-
-	// Cache in Redis
-	cacheKey := fmt.Sprintf("chat:%s:messages", chatID.String())
-	msgResponse := MessageResponse{
-		ID:        message.ID,
-		ChatID:    message.ChatID,
-		Role:      message.Role,
-		Content:   message.Content,
-		Timestamp: message.Timestamp,
-	}
-
-	if err := cacheMessage(ctx, cacheKey, msgResponse); err != nil {
-		log.Printf("Failed to cache message: %v", err)
-	}
-
-	return &message, nil
+	c.JSON(http.StatusOK, messagesToResponses(messages))
 }
 
 func streamAIResponseHandler(c *gin.Context) {
@@ -388,70 +421,61 @@ func streamAIResponseHandler(c *gin.Context) {
 
 	ctx := context.Background()
 
-	cacheKey := fmt.Sprintf("chat:%s:messages", chatID.String())
-	var previousMessages []Message
-	previousMessages, fetchErr := getCachedMessages(ctx, cacheKey)
-	if fetchErr != nil || len(previousMessages) == 0 {
-		// Fallback to database
-		if dbErr := db.Where("chat_id = ?", chatID).Order("created_at ASC").Find(&previousMessages).Error; dbErr != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch chat history"})
-			return
-		}
-
-		// Cache the messages we got from database
-		if cacheErr := cacheMessagesFromDB(ctx, cacheKey, previousMessages); cacheErr != nil {
-			log.Printf("Failed to cache messages from DB: %v", cacheErr)
-		}
+	// Get previous messages
+	previousMessages, err := getChatMessages(ctx, chatID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch chat history"})
+		return
 	}
 
-	// Convert previous messages to Ollama format
+	// Convert previous messages to Ollama format and add the current message
 	ollamaMessages := convertToOllamaMessages(previousMessages)
-
-	// Add the current message
 	ollamaMessages = append(ollamaMessages, OllamaMessage{
 		Role:    "user",
 		Content: req.Content,
 	})
 
-	// Prepare and send Ollama request
-	ollamaReq := prepareOllamaRequest(ollamaMessages, req.Model)
-	setupStreamHeaders(c)
+	// Save the user message
+	if _, err := createAndSaveMessage(ctx, chatID, "user", req.Content); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to save user message"})
+		return
+	}
 
-	// Create channels for response handling
+	// Setup HTTP response for streaming
+	c.Header("Content-Type", "text/plain")
+	c.Header("Cache-Control", "no-cache")
+	c.Header("Connection", "keep-alive")
+	c.Header("Transfer-Encoding", "chunked")
+
+	// Setup channels for communication
 	responseChan := make(chan string)
 	errorChan := make(chan error)
 
 	// Make request to Ollama API
 	go func() {
-		// Log request
-		if err := logOllamaRequest(ollamaReq); err != nil {
+		// Create and send request
+		request, err := setupOllamaRequest(ollamaMessages, req.Model)
+		if err != nil {
 			errorChan <- err
 			return
 		}
 
-		// Get Ollama URL and prepare request
-		ollamaURL := getOllamaURL()
-		reqBody, err := json.Marshal(ollamaReq)
-		if err != nil {
-			errorChan <- fmt.Errorf("failed to marshal request body: %v", err)
-			return
-		}
-
-		resp, err := http.Post(ollamaURL, "application/json", bytes.NewBuffer(reqBody))
+		client := &http.Client{}
+		resp, err := client.Do(request)
 		if err != nil {
 			log.Printf("❌ Error connecting to Ollama: %v", err)
 			errorChan <- err
 			return
 		}
 		defer resp.Body.Close()
+
 		log.Printf("✅ Connected to Ollama (Status: %s)", resp.Status)
 
-		// Create a scanner to read the streaming response line by line
+		// Process streaming response
 		scanner := bufio.NewScanner(resp.Body)
 		for scanner.Scan() {
 			// Get raw response
 			rawResp := scanner.Text()
-			log.Printf("📥 Raw response: %s", rawResp)
 
 			// Skip empty lines
 			if rawResp == "" {
@@ -468,6 +492,7 @@ func streamAIResponseHandler(c *gin.Context) {
 			// Skip [DONE] message
 			if jsonData == "[DONE]" {
 				log.Println("✅ Received [DONE] message")
+				close(responseChan)
 				return
 			}
 
@@ -503,12 +528,6 @@ func streamAIResponseHandler(c *gin.Context) {
 		}
 	}()
 
-	// Save and cache the user's message
-	if _, saveErr := createAndCacheMessage(ctx, chatID, "user", req.Content); saveErr != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to save user message"})
-		return
-	}
-
 	// Stream the response
 	var fullResponse string
 	c.Stream(func(w io.Writer) bool {
@@ -516,23 +535,20 @@ func streamAIResponseHandler(c *gin.Context) {
 		case token, ok := <-responseChan:
 			if !ok {
 				// Save and cache the complete AI response
-				_, saveErr := createAndCacheMessage(ctx, chatID, "assistant", fullResponse)
-				if saveErr != nil {
-					errorChan <- err
-					return false
+				if _, err := createAndSaveMessage(ctx, chatID, "assistant", fullResponse); err != nil {
+					log.Printf("Failed to save AI response: %v", err)
 				}
-
 				return false
 			}
-			
+
 			fullResponse += token
 			fmt.Fprint(w, token)
 			return true
-			
+
 		case err := <-errorChan:
 			fmt.Fprint(w, "Error: "+err.Error())
 			return false
-			
+
 		case <-c.Request.Context().Done():
 			return false
 		}
