@@ -171,11 +171,6 @@ func initDB(config *Config) error {
 	sqlDB.SetMaxOpenConns(100)
 	sqlDB.SetConnMaxLifetime(time.Hour)
 
-	// Auto migrate the schema
-	if err := db.AutoMigrate(&User{}, &Chat{}, &Message{}); err != nil {
-		return fmt.Errorf("failed to migrate database: %w", err)
-	}
-
 	log.Println("✅ Successfully connected to database")
 	return nil
 }
