@@ -292,13 +292,6 @@ func (h *handler) prepareOllamaRequest(messages []models.OllamaMessage, model st
 	}
 }
 
-func (h *handler) setupStreamHeaders(c *gin.Context) {
-	c.Header("Content-Type", "text/plain")
-	c.Header("Cache-Control", "no-cache")
-	c.Header("Connection", "keep-alive")
-	c.Header("Transfer-Encoding", "chunked")
-}
-
 func (h *handler) logOllamaRequest(ollamaReq models.OllamaChatRequest) error {
 	reqBody, err := json.Marshal(ollamaReq)
 	if err != nil {
@@ -329,6 +322,7 @@ func (h *handler) StreamAIResponse(c *gin.Context) {
 
 	ctx := context.Background()
 
+	// Fetch previous messages
 	cacheKey := fmt.Sprintf("chat:%s:messages", chatID.String())
 	var previousMessages []models.Message
 	previousMessages, fetchErr := h.getCachedMessages(ctx, cacheKey)
@@ -356,108 +350,92 @@ func (h *handler) StreamAIResponse(c *gin.Context) {
 		Content: req.Content,
 	})
 
-	// Prepare and send Ollama request
+	// Prepare Ollama request
 	ollamaReq := h.prepareOllamaRequest(ollamaMessages, req.Model)
-	h.setupStreamHeaders(c)
 
-	// Create channels for response handling
-	responseChan := make(chan string)
-	errorChan := make(chan error)
+	// Set headers for SSE
+	c.Header("Content-Type", "text/event-stream")
+	c.Header("Cache-Control", "no-cache")
+	c.Header("Connection", "keep-alive")
+	c.Header("X-Accel-Buffering", "no")
+
+	// Save the user's message
+	if _, saveErr := h.createAndCacheMessage(ctx, chatID, "user", req.Content); saveErr != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to save user message"})
+		return
+	}
+
+	// Log request
+	if err := h.logOllamaRequest(ollamaReq); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	// Prepare request body
+	reqBody, err := json.Marshal(ollamaReq)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Failed to marshal request: %v", err)})
+		return
+	}
 
 	// Make request to Ollama API
-	go func() {
-		// Log request
-		if err := h.logOllamaRequest(ollamaReq); err != nil {
-			errorChan <- err
-			return
-		}
+	resp, err := http.Post(h.getOllamaURL(), "application/json", bytes.NewBuffer(reqBody))
+	if err != nil {
+		log.Printf("❌ Error connecting to Ollama: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Failed to connect to Ollama: %v", err)})
+		return
+	}
+	defer resp.Body.Close()
 
-		reqBody, err := json.Marshal(ollamaReq)
-		if err != nil {
-			errorChan <- fmt.Errorf("failed to marshal request body: %v", err)
-			return
-		}
+	log.Printf("✅ Connected to Ollama (Status: %s)", resp.Status)
 
-		resp, err := http.Post(h.getOllamaURL(), "application/json", bytes.NewBuffer(reqBody))
-		if err != nil {
-			log.Printf("❌ Error connecting to Ollama: %v", err)
-			errorChan <- err
-			return
-		}
-
-		defer resp.Body.Close()
-		log.Printf("✅ Connected to Ollama (Status: %s)", resp.Status)
-
-		// Create a scanner to read the streaming response line by line
+	// Stream the response directly while extracting content for saving
+	var fullResponse string
+	c.Stream(func(w io.Writer) bool {
 		scanner := bufio.NewScanner(resp.Body)
 		for scanner.Scan() {
-			// Get raw response
-			rawResp := scanner.Text()
+			line := scanner.Text()
 
-			// Parse the JSON response
+			// Forward the raw SSE event directly to the client
+			fmt.Fprintln(w, line)
+
+			// Extract content for saving to database
 			var ollamaResp models.OllamaResponse
-			if err := json.Unmarshal([]byte(rawResp), &ollamaResp); err != nil {
-				log.Printf("❌ Error parsing response: %v", err)
-				continue
-			}
-
-			if ollamaResp.Error != nil {
-				log.Printf("❌ Ollama error: %s (%s)", ollamaResp.Error.Message, ollamaResp.Error.Type)
-				errorChan <- fmt.Errorf("%s: %s", ollamaResp.Error.Type, ollamaResp.Error.Message)
-				return
-			}
-
-			// Process each choice in the response
-			for _, choice := range ollamaResp.Choices {
-				if choice.Delta.Content != "" {
-					responseChan <- choice.Delta.Content
+			if err := json.Unmarshal([]byte(line), &ollamaResp); err == nil {
+				for _, choice := range ollamaResp.Choices {
+					if choice.Delta.Content != "" {
+						fullResponse += choice.Delta.Content
+					}
+					if choice.FinishReason == "stop" {
+						log.Println("✅ Response completed")
+						// Save the assistant's complete response
+						if _, saveErr := h.createAndCacheMessage(ctx, chatID, "assistant", fullResponse); saveErr != nil {
+							log.Printf("Failed to save assistant response: %v", saveErr)
+						}
+						return false
+					}
 				}
-				if choice.FinishReason == "stop" {
-					log.Println("✅ Response completed")
-					close(responseChan)
-					break
+
+				// Check for errors in the response
+				if ollamaResp.Error != nil {
+					log.Printf("❌ Ollama error: %s (%s)", ollamaResp.Error.Message, ollamaResp.Error.Type)
+					return false
 				}
 			}
 		}
 
 		if err := scanner.Err(); err != nil {
 			log.Printf("❌ Scanner error: %v", err)
-			errorChan <- err
+			return false
 		}
-	}()
 
-	// Save and cache the user's message
-	if _, saveErr := h.createAndCacheMessage(ctx, chatID, "user", req.Content); saveErr != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to save user message"})
-		return
-	}
-
-	// Stream the response
-	var fullResponse string
-	c.Stream(func(w io.Writer) bool {
-		select {
-		case token, ok := <-responseChan:
-			if !ok {
-				// Save and cache the complete AI response
-				_, saveErr := h.createAndCacheMessage(ctx, chatID, "assistant", fullResponse)
-				if saveErr != nil {
-					errorChan <- err
-					return false
-				}
-
-				return false
+		// Save the response if we haven't already (in case there was no explicit stop)
+		if fullResponse != "" {
+			if _, saveErr := h.createAndCacheMessage(ctx, chatID, "assistant", fullResponse); saveErr != nil {
+				log.Printf("Failed to save assistant response: %v", saveErr)
 			}
-
-			fullResponse += token
-			fmt.Fprint(w, token)
-			return true
-
-		case err := <-errorChan:
-			fmt.Fprint(w, "Error: "+err.Error())
-			return false
-
-		case <-c.Request.Context().Done():
-			return false
 		}
+
+		return false
 	})
 }
